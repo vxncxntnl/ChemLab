@@ -1,0 +1,529 @@
+<?php
+
+namespace App\Services;
+
+use App\Mail\AccountStatusMail;
+use App\Mail\BorrowingStatusMail;
+use App\Models\Activity;
+use App\Models\Borrowing;
+use App\Models\BorrowingEquipment;
+use App\Models\DamageReport;
+use App\Models\User;
+use App\Models\UserNotification;
+use App\Support\CampusAccess;
+use Illuminate\Support\Facades\Mail;
+use Illuminate\Support\Collection;
+
+class NotificationService
+{
+    // The admin's notification for each QR activity request; the grouped
+    // Borrowings list counts the unread ones per activity.
+    public const QR_REQUEST_TITLE = 'New QR Activity Request — Waiting for Your Approval';
+
+    public static function send(User $user, string $title, string $message, string $type = 'info', ?string $link = null): void
+    {
+        // In-system notification
+        UserNotification::create([
+            'user_id' => $user->id,
+            'title'   => $title,
+            'message' => $message,
+            'type'    => $type,
+            'link'    => $link,
+        ]);
+    }
+
+    public static function sendWithEmail(User $user, string $title, string $message, string $type = 'info', ?string $link = null): void
+    {
+        self::send($user, $title, $message, $type, $link);
+
+        // Send email
+        try {
+            Mail::to($user->email)->send(new BorrowingStatusMail($user, $title, $message));
+        } catch (\Throwable $e) {
+            // The in-system notification is already saved, so the user's
+            // action still succeeds — but the failure is logged (it used to
+            // be swallowed silently, which hid why hosted email wasn't
+            // arriving).
+            report($e);
+        }
+    }
+
+    // ─── Account Notifications ────────────────────────────────────────────────
+
+    public static function accountPendingApproval(User $user): void
+    {
+        self::sendWithEmail(
+            $user,
+            'Account Submitted',
+            'Your account has been submitted successfully. Please wait for the administrator to review and approve your account.',
+            'info'
+        );
+    }
+
+    public static function facultyRegistered(User $user): void
+    {
+        // Notify the faculty themselves
+        self::sendWithEmail(
+            $user,
+            'Faculty Account Pending Approval',
+            "Welcome, {$user->name}! Your faculty account has been submitted successfully. An administrator needs to verify it before you can log in — you'll get another email once that's done.",
+            'info'
+        );
+
+        // Notify the admin who approves this campus's faculty (its own
+        // admin, or the main campus admin while it has none).
+        self::notifyAdminsOf(
+            $user->campus_id,
+            'New Faculty Registration — Please Verify',
+            "{$user->name} ({$user->email}) has registered as a faculty member under the {$user->department} department at {$user->campus?->campus_name}. Please verify this account in Users management.",
+            'info',
+            '/admin/users'
+        );
+    }
+
+    public static function accountApproved(User $user): void
+    {
+        self::sendWithEmail(
+            $user,
+            'Account Approved',
+            'Your account has been approved. You can now log in to the Science Laboratory Borrowing System.',
+            'success'
+        );
+    }
+
+    public static function accountSuspended(User $user): void
+    {
+        self::sendWithEmail(
+            $user,
+            'Account Suspended',
+            'Your account has been suspended. Please contact the laboratory administrator for more information.',
+            'error'
+        );
+    }
+
+    // ─── Borrowing Notifications ──────────────────────────────────────────────
+
+    /** The admin handling a campus (its own, else the main campus admin). */
+    private static function notifyAdminsOf(?int $campusId, string $title, string $message, string $type, string $link, bool $email = true): void
+    {
+        foreach (CampusAccess::adminsFor($campusId) as $admin) {
+            $email ? self::sendWithEmail($admin, $title, $message, $type, $link) : self::send($admin, $title, $message, $type, $link);
+        }
+    }
+
+    /** Lab staff of one campus only. */
+    private static function notifyLabStaffOf(?int $campusId, string $title, string $message, string $type, string $link): void
+    {
+        if (!$campusId) {
+            return;
+        }
+        User::where('role', 'lab_staff')->where('status', 'active')->where('campus_id', $campusId)
+            ->each(fn (User $user) => self::sendWithEmail($user, $title, $message, $type, $link));
+    }
+
+    /** The campus a borrowing's equipment comes from. */
+    private static function campusOf(Borrowing $borrowing): ?int
+    {
+        return $borrowing->borrowingEquipment()->with('inventory:id,campus_id')->first()?->inventory?->campus_id
+            ?? $borrowing->user?->campus_id;
+    }
+
+    private static function borrowingLink(Borrowing $borrowing): string
+    {
+        $user = $borrowing->user;
+        $prefix = match ($user->role) {
+            'faculty' => '/faculty',
+            default   => '/student',
+        };
+        return "{$prefix}/borrowings/{$borrowing->id}";
+    }
+
+    public static function borrowingSubmitted(Borrowing $borrowing, bool $notifyFaculty = true): void
+    {
+        $user        = $borrowing->user;
+        $facultyName = $borrowing->faculty?->name ?? 'your faculty';
+
+        // Notify the student
+        self::sendWithEmail(
+            $user,
+            'Borrow Request Submitted — Waiting for Faculty Approval',
+            "Your borrow request #{$borrowing->id} has been submitted successfully. It is now waiting for approval from {$facultyName}.",
+            'info',
+            self::borrowingLink($borrowing)
+        );
+
+        // Notify the faculty — skipped when the request will be auto-approved via
+        // an activity QR code, since "requires your approval" would be inaccurate
+        // (see borrowingAutoApprovedViaQr for the notification sent in that case).
+        if ($notifyFaculty && $borrowing->faculty) {
+            self::sendWithEmail(
+                $borrowing->faculty,
+                'New Borrow Request Awaiting Your Approval',
+                "A new borrow request #{$borrowing->id} from {$user->name} requires your approval.",
+                'info',
+                "/faculty/borrowings/{$borrowing->id}"
+            );
+        }
+    }
+
+    public static function borrowingAutoApprovedViaQr(Borrowing $borrowing, Activity $activity): void
+    {
+        // The request now waits for the admin, so tell them — in-app only:
+        // a whole class scanning the QR shouldn't flood their inbox.
+        self::notifyAdminsOf(
+            self::campusOf($borrowing),
+            self::QR_REQUEST_TITLE,
+            "{$borrowing->user->name} requested equipment for the activity \"{$activity->title}\" by scanning its QR code (request #{$borrowing->id}).",
+            'info',
+            "/admin/borrowings/{$borrowing->id}",
+            email: false
+        );
+
+        if (!$borrowing->faculty) {
+            return;
+        }
+
+        $user = $borrowing->user;
+        $equipmentNames = $borrowing->borrowingEquipment->pluck('equipment.name')->filter()->implode(', ');
+
+        self::sendWithEmail(
+            $borrowing->faculty,
+            'Student Borrowed Equipment via Your Activity QR Code',
+            "{$user->name} scanned the QR code for your activity \"{$activity->title}\" and borrowed {$equipmentNames} (request #{$borrowing->id}). " .
+                "This request has been auto-approved on your behalf — no action is needed from you.",
+            'info',
+            "/faculty/borrowings/{$borrowing->id}"
+        );
+    }
+
+    public static function borrowingApprovedByFaculty(Borrowing $borrowing, User $approver): void
+    {
+        $user = $borrowing->user;
+
+        // Notify the student
+        self::sendWithEmail(
+            $user,
+            'Approved by Faculty — Waiting for Admin Approval',
+            "Your borrow request #{$borrowing->id} has been approved by {$approver->name}. It is now waiting for approval from the administrator.",
+            'success',
+            self::borrowingLink($borrowing)
+        );
+
+        // Notify the campus's admin
+        self::notifyAdminsOf(
+            self::campusOf($borrowing),
+            'New Borrow Request Awaiting Admin Approval',
+            "Borrow request #{$borrowing->id} from {$user->name} has been approved by faculty ({$approver->name}) and is now waiting for your review.",
+            'info',
+            "/admin/borrowings/{$borrowing->id}"
+        );
+    }
+
+    public static function borrowingRejectedByFaculty(Borrowing $borrowing, User $approver): void
+    {
+        $user = $borrowing->user;
+        $message = "Your borrow request #{$borrowing->id} has been rejected by {$approver->name}.";
+        $message .= $borrowing->rejection_reason
+            ? " Reason: \"{$borrowing->rejection_reason}\""
+            : ' Please coordinate with your faculty for more information.';
+
+        self::sendWithEmail(
+            $user,
+            'Borrow Request Rejected by Faculty',
+            $message,
+            'error',
+            self::borrowingLink($borrowing)
+        );
+    }
+
+    public static function borrowingApprovedByAdmin(Borrowing $borrowing, User $approver): void
+    {
+        $user = $borrowing->user;
+
+        // Notify the student
+        self::sendWithEmail(
+            $user,
+            'Borrow Request Fully Approved',
+            "Your borrow request #{$borrowing->id} has been approved by {$approver->name}. It is now waiting for equipment release by the laboratory staff.",
+            'success',
+            self::borrowingLink($borrowing)
+        );
+
+        // Notify lab staff to prepare for release
+        self::notifyLabStaffOf(
+            self::campusOf($borrowing),
+            'Borrow Request Approved — Ready for Equipment Release',
+            "Borrow request #{$borrowing->id} from {$user->name} has been fully approved by admin ({$approver->name}). Please prepare the equipment for release.",
+            'success',
+            "/lab/borrowings/{$borrowing->id}"
+        );
+    }
+
+    public static function borrowingRejectedByAdmin(Borrowing $borrowing, User $approver): void
+    {
+        $user = $borrowing->user;
+        $message = "Your borrow request #{$borrowing->id} has been rejected by {$approver->name}.";
+        $message .= $borrowing->rejection_reason
+            ? " Reason: \"{$borrowing->rejection_reason}\""
+            : ' Please contact the laboratory administrator for more information.';
+
+        self::sendWithEmail(
+            $user,
+            'Borrow Request Rejected by Admin',
+            $message,
+            'error',
+            self::borrowingLink($borrowing)
+        );
+    }
+
+    public static function borrowingReleased(Borrowing $borrowing, User $approver): void
+    {
+        $user = $borrowing->user;
+        $due = $borrowing->return_date ? date('F j, Y', strtotime($borrowing->return_date)) : 'the agreed date';
+        self::sendWithEmail(
+            $user,
+            'Equipment Released',
+            "Your equipment for request #{$borrowing->id} has been released by {$approver->name}. Please return it by {$due}.",
+            'success',
+            self::borrowingLink($borrowing)
+        );
+    }
+
+    public static function borrowingReturned(Borrowing $borrowing): void
+    {
+        $user = $borrowing->user;
+        self::sendWithEmail(
+            $user,
+            'Equipment Returned',
+            "Your borrowed equipment for request #{$borrowing->id} has been returned successfully. Thank you!",
+            'success',
+            self::borrowingLink($borrowing)
+        );
+    }
+
+    public static function borrowingCancelledByActivity(Borrowing $borrowing, Activity $activity, User $cancelledBy): void
+    {
+        self::sendWithEmail(
+            $borrowing->user,
+            'Request Cancelled — Activity Cancelled',
+            "Your borrow request #{$borrowing->id} has been cancelled because the activity \"{$activity->title}\" was cancelled by {$cancelledBy->name}.",
+            'warning',
+            self::borrowingLink($borrowing)
+        );
+    }
+
+    public static function borrowingCancelledByFaculty(Borrowing $borrowing, User $faculty): void
+    {
+        self::sendWithEmail(
+            $borrowing->user,
+            'Request Cancelled by Faculty',
+            "Your borrow request #{$borrowing->id} has been cancelled by {$faculty->name}.",
+            'warning',
+            self::borrowingLink($borrowing)
+        );
+    }
+
+    public static function borrowingCancelled(Borrowing $borrowing): void
+    {
+        $user = $borrowing->user;
+        self::sendWithEmail(
+            $user,
+            'Request Cancelled',
+            "Your borrow request #{$borrowing->id} has been cancelled.",
+            'warning',
+            self::borrowingLink($borrowing)
+        );
+    }
+
+    /**
+     * A student tapped "Report Damage" on a borrowed item: alert the lab
+     * staff of the campus that item belongs to AND the admins (who cover
+     * when no lab staff is around), so someone can check it when the
+     * student brings it in. No damage report exists yet — staff record it
+     * after verifying.
+     */
+    public static function possibleDamageReported(Borrowing $borrowing, BorrowingEquipment $item, User $student): void
+    {
+        $campusId = $item->inventory?->campus_id;
+        $labStaff = User::where('role', 'lab_staff')->where('status', 'active')
+            ->where('campus_id', $campusId)
+            ->get();
+        $admins = CampusAccess::adminsFor($campusId);
+        $recipients = $labStaff->merge($admins)->unique('id');
+
+        $equipment = $item->equipment?->name ?? 'an item';
+        $location = $item->inventory?->location?->location_name;
+        $message = "{$student->name} reported that {$equipment} (borrowing #{$borrowing->id}"
+            . ($location ? ", {$location}" : '') . ") may be damaged."
+            . ($item->damage_report_note ? " Student's note: \"{$item->damage_report_note}\"." : '')
+            . ' Please check the item when the student brings it to the laboratory, then record a damage report if confirmed.';
+
+        foreach ($recipients as $recipient) {
+            self::sendWithEmail(
+                $recipient,
+                'Possible Damage Reported by Student',
+                $message,
+                'warning',
+                $recipient->role === 'admin' ? "/admin/borrowings/{$borrowing->id}" : "/lab/borrowings/{$borrowing->id}"
+            );
+        }
+    }
+
+    /**
+     * Lab staff checked an item the student reported and found it fine.
+     */
+    public static function noDamageFound(Borrowing $borrowing, BorrowingEquipment $item, User $checkedBy): void
+    {
+        $equipment = $item->equipment?->name ?? 'the item';
+        self::sendWithEmail(
+            $borrowing->user,
+            'Equipment Checked — No Damage Found',
+            "{$checkedBy->name} checked {$equipment} from your borrow request #{$borrowing->id} and found no damage. No damage report was filed.",
+            'success',
+            self::borrowingLink($borrowing)
+        );
+    }
+
+    /**
+     * A faculty member created this student's account (or resent the link):
+     * email a one-time "Set Your Password" link. The faculty never sees the
+     * password. A mail failure is logged, not shown — the student can still
+     * use Forgot password.
+     */
+    public static function studentAccountCreated(User $student, User $faculty): void
+    {
+        try {
+            Mail::to($student->email)->send(new \App\Mail\AccountSetupMail(
+                $student,
+                $faculty->name,
+                \App\Support\AccountSetupLink::for($student)
+            ));
+        } catch (\Throwable $e) {
+            report($e);
+        }
+    }
+
+    public static function damageReportFiled(DamageReport $report): void
+    {
+        $borrowing = $report->borrowing;
+        $student   = $borrowing?->user;
+        $faculty   = $borrowing?->faculty;
+        $equipment = $report->equipment;
+
+        $liableLabel = match ($report->liable_party) {
+            'student' => 'Student (borrower)',
+            'faculty' => 'Faculty (instructor in charge)',
+            'shared'  => 'Shared — both student and faculty',
+            default   => 'To be determined',
+        };
+
+        // Notify faculty — they need to follow up with the student
+        if ($faculty) {
+            self::sendWithEmail(
+                $faculty,
+                'Incident Report Filed — Please Contact the Student',
+                "An incident report has been filed for {$equipment?->name} borrowed by {$student?->name} " .
+                    "(Borrowing #{$borrowing->id}). Liable party: {$liableLabel}. " .
+                    "Please contact the student to discuss resolution.",
+                'warning',
+                "/faculty/borrowings/{$borrowing->id}"
+            );
+        }
+
+        // Notify student — faculty will reach out
+        if ($student) {
+            self::sendWithEmail(
+                $student,
+                'Incident Report Filed for Your Borrowing',
+                "An incident report has been filed for {$equipment?->name} you borrowed " .
+                    "(Borrowing #{$borrowing->id}). Liable party: {$liableLabel}. " .
+                    "Your faculty " . ($faculty?->name ?? 'in charge') . " will be contacting you regarding this matter.",
+                'warning',
+                "/student/borrowings/{$borrowing->id}"
+            );
+        }
+    }
+
+    /**
+     * Lab staff (possibly a student assistant) rejected a damage report —
+     * the admins are told so they can reopen it if they disagree.
+     */
+    public static function damageReportRejectedByLabStaff(DamageReport $report, User $labStaff): void
+    {
+        $equipment = $report->equipment?->name ?? 'the item';
+        $days = DamageReport::REOPEN_DAYS;
+        $reason = rtrim((string) $report->rejection_reason, '. ');
+
+        CampusAccess::adminsFor($labStaff->campus_id)->each(fn (User $admin) => self::sendWithEmail(
+            $admin,
+            'Damage Report Rejected by Lab Staff',
+            "Lab staff {$labStaff->name} rejected Damage Report #{$report->id} ({$equipment}, borrowing #{$report->borrowing_id}) — reason: {$reason}. You can reopen it within {$days} days if you disagree.",
+            'warning',
+            "/admin/damage-reports/{$report->id}"
+        ));
+    }
+
+    /** Lab staff edited a damage report — the campus admin is told, like for a rejection. */
+    public static function damageReportEditedByLabStaff(DamageReport $report, User $labStaff, string $note): void
+    {
+        $equipment = $report->equipment?->name ?? 'the item';
+        $note = rtrim($note, '. ');
+
+        CampusAccess::adminsFor($labStaff->campus_id)->each(fn (User $admin) => self::sendWithEmail(
+            $admin,
+            'Damage Report Edited by Lab Staff',
+            "Lab staff {$labStaff->name} edited Damage Report #{$report->id} ({$equipment}, borrowing #{$report->borrowing_id}). Note: {$note}. See the report's Decision History for what changed.",
+            'info',
+            "/admin/damage-reports/{$report->id}"
+        ));
+    }
+
+    public const JOIN_REQUEST_TITLE = 'Students Waiting to Join Your Activity';
+
+    /**
+     * A student scanned the activity QR and waits for approval. In-app only,
+     * and at most one unread notice per activity (a whole class scanning
+     * shouldn't flood the instructor).
+     */
+    public static function joinRequestReceived(Activity $activity, User $student): void
+    {
+        $instructor = $activity->instructor;
+        $link = "/faculty/activities/{$activity->id}";
+        if (!$instructor || UserNotification::where('user_id', $instructor->id)->whereNull('read_at')
+            ->where('title', self::JOIN_REQUEST_TITLE)->where('link', $link)->exists()) {
+            return;
+        }
+
+        self::send(
+            $instructor,
+            self::JOIN_REQUEST_TITLE,
+            "{$student->name} and possibly others scanned the QR code for \"{$activity->title}\". Open the activity to approve the students in your class.",
+            'info',
+            $link
+        );
+    }
+
+    /** The instructor approved the student: they can borrow now. */
+    public static function joinApproved(Activity $activity, User $student): void
+    {
+        self::sendWithEmail(
+            $student,
+            'You Can Now Borrow for Your Activity',
+            "Your instructor approved you for \"{$activity->title}\". You can now request the equipment for this activity.",
+            'success',
+            "/student/borrowings/create?activity_id={$activity->id}"
+        );
+    }
+
+    public static function damageReported(Borrowing $borrowing): void
+    {
+        $user = $borrowing->user;
+        self::sendWithEmail(
+            $user,
+            'Damage Report Filed',
+            "A damage report has been filed for your borrowing request #{$borrowing->id}. Please coordinate with the laboratory administrator.",
+            'error',
+            self::borrowingLink($borrowing)
+        );
+    }
+}

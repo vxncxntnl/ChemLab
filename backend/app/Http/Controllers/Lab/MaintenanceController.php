@@ -1,0 +1,110 @@
+<?php
+
+namespace App\Http\Controllers\Lab;
+
+use App\Http\Controllers\Controller;
+use App\Models\Equipment;
+use App\Models\EquipmentInventory;
+use App\Models\MaintenanceLog;
+use Illuminate\Http\Request;
+use Illuminate\Validation\Rule;
+use Inertia\Inertia;
+
+class MaintenanceController extends Controller
+{
+    public function index()
+    {
+        $campusId = auth()->user()->campus_id;
+
+        // Only show maintenance logs for equipment at this lab staff's campus
+        $logs = \App\Support\CampusAccess::maintenance(MaintenanceLog::query(), (int) $campusId)->with(['equipment', 'performer', 'unit:id,unit_code,serial_number'])
+            ->latest()
+            ->paginate(15);
+
+        return Inertia::render('Lab/Maintenance/Index', [
+            'logs' => $logs,
+        ]);
+    }
+
+    public function create()
+    {
+        $campusId = auth()->user()->campus_id;
+
+        // Only show equipment available at this campus
+        $equipment = EquipmentInventory::with('equipment')
+            ->where('campus_id', $campusId)
+            ->get()
+            ->map(fn($inv) => [
+                'id'   => $inv->equipment->id,
+                'name' => $inv->equipment->name . ' (' . $inv->location?->location_name . ')',
+            ])
+            ->unique('id')
+            // A–Z, ignoring upper/lower case.
+            ->sortBy('name', SORT_NATURAL | SORT_FLAG_CASE)
+            ->values();
+
+        return Inertia::render('Lab/Maintenance/Create', [
+            // Serial-tracked items list their units, so the exact one can be chosen.
+            'equipment' => \App\Support\MaintenanceUnits::withUnits($equipment, (int) $campusId),
+        ]);
+    }
+
+    public function store(Request $request)
+    {
+        $campusId = auth()->user()->campus_id;
+
+        $validated = $request->validate([
+            // create()'s dropdown only ever offers equipment stocked at this
+            // lab staff's own campus — enforce that here too, or a crafted
+            // request could log maintenance against another campus's item.
+            'equipment_id'          => [
+                'required',
+                Rule::exists('equipment', 'id')->where(
+                    fn ($query) => $query->whereIn('id', EquipmentInventory::where('campus_id', $campusId)->pluck('equipment_id'))
+                ),
+            ],
+            'type'                  => ['required', \Illuminate\Validation\Rule::in(MaintenanceLog::TYPES)],
+            'description'           => 'required|string',
+            'cost'                  => 'nullable|numeric|min:0',
+            'maintenance_date'      => 'required|date',
+            'next_maintenance_date' => 'nullable|date|after:maintenance_date',
+            'status'                => ['required', \Illuminate\Validation\Rule::in(MaintenanceLog::NEW_STATUSES)],
+            'notes'                 => 'nullable|string',
+        ]);
+
+        $validated['performed_by'] = auth()->id();
+        $validated['equipment_unit_id'] = \App\Support\MaintenanceUnits::validatedUnitId($request, (int) $campusId);
+        $validated['campus_id'] = $campusId;
+
+        $maintenance = MaintenanceLog::create(MaintenanceLog::normalize($validated));
+        // Scheduled for today: tell the campus lab staff/admin now.
+        app(\App\Services\MaintenanceReminderService::class)->notifyIfToday($maintenance, auth()->user());
+
+        // If it's a completed repair, restore equipment condition to good
+        if ($validated['type'] === 'repair' && $validated['status'] === 'completed') {
+            Equipment::where('id', $validated['equipment_id'])
+                ->update(['condition' => 'good']);
+        }
+
+        return redirect()->route('lab.maintenance.index')
+            ->with('success', 'Maintenance log recorded successfully.');
+    }
+
+    public function show(MaintenanceLog $maintenance)
+    {
+        $campusId = auth()->user()->campus_id;
+
+        // Ensure this maintenance record belongs to the lab staff's campus
+        $inCampus = \App\Support\CampusAccess::maintenance(MaintenanceLog::query(), (int) $campusId)->whereKey($maintenance->id)->exists();
+
+        if (!$inCampus) {
+            abort(403);
+        }
+
+        $maintenance->load(['equipment', 'performer', 'unit']);
+
+        return Inertia::render('Lab/Maintenance/Show', [
+            'maintenance' => $maintenance,
+        ]);
+    }
+}

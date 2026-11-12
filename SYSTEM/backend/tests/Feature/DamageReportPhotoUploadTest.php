@@ -1,0 +1,130 @@
+<?php
+
+namespace Tests\Feature;
+
+use App\Models\Borrowing;
+use App\Models\BorrowingEquipment;
+use App\Models\Campus;
+use App\Models\DamageReport;
+use App\Models\Equipment;
+use App\Models\EquipmentInventory;
+use App\Models\Location;
+use App\Models\User;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Http\UploadedFile;
+use Illuminate\Support\Facades\Storage;
+use Tests\TestCase;
+
+/**
+ * Optional damage photo: JPG/PNG/WebP up to 10 MB, checked by real file
+ * content, stored privately under a random name, viewable only by staff.
+ */
+class DamageReportPhotoUploadTest extends TestCase
+{
+    use RefreshDatabase;
+
+    private User $labStaff;
+    private DamageReport $report;
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+        Storage::fake('local');
+        $campus = Campus::create(['campus_name' => 'Main Campus']);
+        $location = Location::create(['campus_id' => $campus->id, 'location_name' => 'Lab']);
+        $equipment = Equipment::create(['equipment_code' => 'EQ-' . uniqid(), 'name' => 'Beaker', 'condition' => 'good', 'is_available' => true]);
+        $inventory = EquipmentInventory::create(['equipment_id' => $equipment->id, 'campus_id' => $campus->id, 'location_id' => $location->id, 'total_quantity' => 5, 'available_quantity' => 4]);
+        $student = User::factory()->create(['role' => 'student', 'status' => 'active']);
+        $borrowing = Borrowing::create(['user_id' => $student->id, 'borrow_date' => now(), 'return_date' => now()->addDay(), 'status' => 'returned']);
+        BorrowingEquipment::create(['borrowing_id' => $borrowing->id, 'equipment_id' => $equipment->id, 'inventory_id' => $inventory->id, 'quantity' => 1, 'condition_on_borrow' => 'good']);
+        $this->labStaff = User::factory()->create(['role' => 'lab_staff', 'status' => 'active', 'campus_id' => $campus->id]);
+        $this->report = DamageReport::create([
+            'borrowing_id' => $borrowing->id, 'equipment_id' => $equipment->id, 'quantity' => 1,
+            'equipment_inventory_id' => $inventory->id, 'reported_by' => $this->labStaff->id,
+            'description' => 'Cracked', 'status' => 'pending',
+        ]);
+    }
+
+    /**
+     * A real temporary file (not Laravel's fake), so the type is detected
+     * from the actual bytes exactly as it is for a real upload.
+     */
+    private function realFile(string $name, string $bytes, int $padToBytes = 0): UploadedFile
+    {
+        $path = tempnam(sys_get_temp_dir(), 'upl');
+        file_put_contents($path, $padToBytes > strlen($bytes) ? str_pad($bytes, $padToBytes, "\0") : $bytes);
+
+        return new UploadedFile($path, $name, null, null, true);
+    }
+
+    private function jpegBytes(): string
+    {
+        return "\xFF\xD8\xFF\xE0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00";
+    }
+
+    private function pngBytes(): string
+    {
+        return base64_decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==');
+    }
+
+    private function webpBytes(): string
+    {
+        return 'RIFF' . pack('V', 26) . 'WEBPVP8 ' . pack('V', 14) . str_repeat("\x00", 14);
+    }
+
+    private function assess(?UploadedFile $photo)
+    {
+        return $this->actingAs($this->labStaff)->post("/lab/damage-reports/{$this->report->id}/assess", $photo ? ['photo' => $photo] : []);
+    }
+
+    public function test_jpg_png_and_webp_photos_are_accepted(): void
+    {
+        $this->assess($this->realFile('photo.jpg', $this->jpegBytes()))->assertSessionHasNoErrors();
+        $this->assess($this->realFile('photo.jpeg', $this->jpegBytes()))->assertSessionHasNoErrors();
+        $this->assess($this->realFile('photo.png', $this->pngBytes()))->assertSessionHasNoErrors();
+        $this->assess($this->realFile('photo.webp', $this->webpBytes()))->assertSessionHasNoErrors();
+    }
+
+    public function test_a_10mb_phone_photo_is_accepted_and_stored_privately_under_a_random_name(): void
+    {
+        $this->assess($this->realFile('IMG_1234.jpg', $this->jpegBytes(), 10240 * 1024))->assertSessionHasNoErrors();
+
+        $path = $this->report->fresh()->photo_path;
+        $this->assertNotNull($path);
+        $this->assertStringStartsWith('damage-reports/', $path);
+        $this->assertStringNotContainsString('IMG_1234', $path, 'The original filename is never used.');
+        Storage::disk('local')->assertExists($path);
+    }
+
+    public function test_a_photo_over_10mb_is_rejected(): void
+    {
+        $this->assess($this->realFile('big.jpg', $this->jpegBytes(), 10241 * 1024))->assertSessionHasErrors('photo');
+        $this->assertNull($this->report->fresh()->photo_path);
+    }
+
+    public function test_non_image_and_disguised_files_are_rejected(): void
+    {
+        $this->assess($this->realFile('report.pdf', "%PDF-1.4
+%fake pdf
+"))->assertSessionHasErrors('photo');
+        $this->assess($this->realFile('photo.jpg', '<?php echo "hacked"; ?>'))->assertSessionHasErrors('photo');
+        $this->assess($this->realFile('image.svg', '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'))->assertSessionHasErrors('photo');
+
+        $this->assertNull($this->report->fresh()->photo_path);
+    }
+
+    public function test_the_photo_is_optional(): void
+    {
+        $this->assess(null)->assertSessionHasNoErrors();
+        $this->assertSame('assessed', $this->report->fresh()->status);
+    }
+
+    public function test_a_student_cannot_view_the_photo(): void
+    {
+        $this->assess($this->realFile('photo.jpg', $this->jpegBytes()))->assertSessionHasNoErrors();
+        $student = User::factory()->create(['role' => 'student', 'status' => 'active']);
+
+        $this->actingAs($student)->get("/lab/damage-reports/{$this->report->id}/photo")->assertForbidden();
+        $this->actingAs($this->labStaff)->get("/lab/damage-reports/{$this->report->id}/photo")->assertOk();
+    }
+}
